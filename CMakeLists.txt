@@ -16,7 +16,7 @@ target_compile_definitions(sqlite3 PRIVATE SQLITE_THREADSAFE=1 SQLITE_OMIT_LOAD_
 add_library(quickclipboard_core STATIC src/core.cpp src/database.cpp src/hotkey.cpp src/ui.cpp src/startup.cpp)
 target_include_directories(quickclipboard_core PUBLIC src)
 target_link_libraries(quickclipboard_core PUBLIC sqlite3 crypt32 bcrypt shell32 advapi32 comctl32)
-add_executable(QuickClipboard WIN32 src/main.cpp src/app.cpp src/quickclipboard.rc)
+add_executable(QuickClipboard WIN32 src/main.cpp src/app.cpp src/record_drag.cpp src/quickclipboard.rc)
 target_include_directories(QuickClipboard PRIVATE assets)
 target_link_libraries(QuickClipboard PRIVATE quickclipboard_core comctl32 dwmapi shlwapi uxtheme)
 if(MSVC)

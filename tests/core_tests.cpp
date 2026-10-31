@@ -211,7 +211,7 @@ int main(int argc, char** argv) {
         auto startup = std::chrono::steady_clock::now();
         {
             Database db(dir / L"test.db"); Settings settings; settings.maxHistory = 10000; settings.retentionDays = 0;
-            require(scalar(db, "PRAGMA user_version") == 3, "schema version");
+            require(scalar(db, "PRAGMA user_version") == 4, "schema version");
             require(db.settings().modifiers == MOD_WIN && db.settings().key == 'V' && !db.settings().hideOutside, "new interaction defaults");
             settings.theme = 2; db.saveSettings(settings); require(db.settings().theme == 2, "settings persistence");
             db.capture(L"中文 SELECT * FROM data WHERE a LIKE '100%_\\'", L"UnitTest", settings);
@@ -291,7 +291,7 @@ int main(int argc, char** argv) {
             DWORD code{}; GetExitCodeProcess(process.hProcess, &code); CloseHandle(process.hThread); CloseHandle(process.hProcess);
             require(code == 99, "expected abrupt child exit");
             Database reopened(dir / L"test.db"); require(!reopened.records(L"独立", -1).empty(), "uncommitted transaction recovery");
-            reopened.exec("PRAGMA user_version=4;");
+            reopened.exec("PRAGMA user_version=5;");
             bool refused = false; try { Database future(dir / L"test.db"); } catch (...) { refused = true; }
             require(refused, "newer schema refuses downgrade");
         }

@@ -13,6 +13,7 @@ public:
     void ascii(int n, const std::string& value) { if (sqlite3_bind_text(stmt_, n, value.data(), static_cast<int>(value.size()), SQLITE_TRANSIENT) != SQLITE_OK) fail(); }
     void blob(int n, const std::vector<unsigned char>& value) { if (sqlite3_bind_blob(stmt_, n, value.data(), static_cast<int>(value.size()), SQLITE_TRANSIENT) != SQLITE_OK) fail(); }
     bool next() { int r = sqlite3_step(stmt_); if (r == SQLITE_ROW) return true; if (r != SQLITE_DONE) fail(); return false; }
+    void reset() { if (sqlite3_reset(stmt_) != SQLITE_OK || sqlite3_clear_bindings(stmt_) != SQLITE_OK) fail(); }
     Id number(int n) { return sqlite3_column_int64(stmt_, n); }
     std::wstring text(int n) { auto p = static_cast<const wchar_t*>(sqlite3_column_text16(stmt_, n)); return p ? std::wstring(p, sqlite3_column_bytes16(stmt_, n) / 2) : L""; }
     std::vector<unsigned char> blob(int n) { auto p = static_cast<const unsigned char*>(sqlite3_column_blob(stmt_, n)); int size = sqlite3_column_bytes(stmt_, n); return p ? std::vector<unsigned char>(p, p + size) : std::vector<unsigned char>{}; }
@@ -39,7 +40,7 @@ std::wstring pattern(const std::wstring& query) {
 Field readField(Statement& s) { return {s.number(0), s.text(1), s.text(2), s.blob(3), s.number(4) != 0}; }
 }
 
-// 首次运行直接建立当前结构；现有数据库必须使用相同结构版本。
+// 建立当前结构，为上一正式版本补充资料排序字段并保留原有数据。
 Database::Database(const std::filesystem::path& file) {
     std::filesystem::create_directories(file.parent_path());
     if (sqlite3_open16(file.c_str(), &db_) != SQLITE_OK) { std::string error = db_ ? sqlite3_errmsg(db_) : "Database open failed"; if (db_) sqlite3_close(db_); db_ = nullptr; throw std::runtime_error(error); }
@@ -47,23 +48,29 @@ Database::Database(const std::filesystem::path& file) {
         sqlite3_busy_timeout(db_, 2000);
         Id v{};
         { Statement version(db_, "PRAGMA user_version"); version.next(); v = version.number(0); }
-        if (v > 3) throw std::runtime_error("数据库版本较新，请使用新版随手贴");
-        if (v != 0 && v != 3) throw std::runtime_error("数据库结构不受支持，请使用当前版本的数据文件");
+        if (v > 4) throw std::runtime_error("数据库版本较新，请使用新版随手贴");
+        if (v != 0 && v != 3 && v != 4) throw std::runtime_error("数据库结构不受支持，请使用当前版本的数据文件");
         exec("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON; PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY;");
         if (v == 0) {
             Transaction tx(*this);
             exec(R"SQL(
 CREATE TABLE groups(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,sort_order INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
-CREATE TABLE records(id INTEGER PRIMARY KEY,group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,name TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',is_pinned INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE records(id INTEGER PRIMARY KEY,group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,name TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',is_pinned INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,last_used_at INTEGER NOT NULL DEFAULT 0,sort_order INTEGER);
 CREATE TABLE record_fields(id INTEGER PRIMARY KEY,record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,name TEXT NOT NULL,plain_value TEXT,encrypted_value BLOB,is_sensitive INTEGER NOT NULL CHECK(is_sensitive IN (0,1)),sort_order INTEGER NOT NULL,CHECK((is_sensitive=0 AND plain_value IS NOT NULL AND encrypted_value IS NULL) OR (is_sensitive=1 AND plain_value IS NULL AND encrypted_value IS NOT NULL)));
 CREATE TABLE clipboard_history(id INTEGER PRIMARY KEY,content TEXT NOT NULL,content_hash TEXT NOT NULL UNIQUE,source_app TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,last_copied_at INTEGER NOT NULL,copy_count INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE INDEX idx_history_recent ON clipboard_history(last_copied_at DESC,id DESC);
 CREATE INDEX idx_records_recent ON records(is_pinned DESC,updated_at DESC,id DESC);
 CREATE INDEX idx_records_group ON records(group_id);
+CREATE INDEX idx_records_order ON records(is_pinned DESC,(sort_order IS NULL),sort_order,updated_at DESC,id DESC);
 CREATE INDEX idx_fields_record ON record_fields(record_id,sort_order);
-PRAGMA user_version=3;
+PRAGMA user_version=4;
 )SQL");
+            tx.commit();
+        }
+        if (v == 3) {
+            Transaction tx(*this);
+            exec("ALTER TABLE records ADD COLUMN sort_order INTEGER; CREATE INDEX idx_records_order ON records(is_pinned DESC,(sort_order IS NULL),sort_order,updated_at DESC,id DESC); PRAGMA user_version=4;");
             tx.commit();
         }
     } catch (...) { sqlite3_close(db_); db_ = nullptr; throw; }
@@ -134,7 +141,7 @@ std::vector<Item> Database::records(const std::wstring& query, Id group, int off
       WHERE (?2=-1 OR coalesce(r.group_id,0)=?2) AND
       (r.name LIKE ?1 ESCAPE '!' OR r.note LIKE ?1 ESCAPE '!' OR g.name LIKE ?1 ESCAPE '!' OR EXISTS
        (SELECT 1 FROM record_fields f WHERE f.record_id=r.id AND (f.name LIKE ?1 ESCAPE '!' OR (f.is_sensitive=0 AND f.plain_value LIKE ?1 ESCAPE '!'))))
-      ORDER BY r.is_pinned DESC,r.updated_at DESC,r.id DESC LIMIT ?3 OFFSET ?4)SQL");
+      ORDER BY r.is_pinned DESC,(r.sort_order IS NULL),r.sort_order,r.updated_at DESC,r.id DESC LIMIT ?3 OFFSET ?4)SQL");
     q.text(1, pattern(query)); q.number(2, group); q.number(3, limit); q.number(4, offset);
     std::vector<Item> items;
     while (q.next()) {
@@ -204,6 +211,25 @@ void Database::clearHistory() { exec("DELETE FROM clipboard_history; PRAGMA wal_
 void Database::removeRecord(Id id) { Statement q(db_, "DELETE FROM records WHERE id=?1"); q.number(1, id); q.next(); }
 void Database::pin(Id id, bool pinned) { Statement q(db_, "UPDATE records SET is_pinned=?2 WHERE id=?1"); q.number(1, id); q.number(2, pinned); q.next(); }
 void Database::used(Id id) { Statement q(db_, "UPDATE records SET last_used_at=?2 WHERE id=?1"); q.number(1, id); q.number(2, now()); q.next(); }
+void Database::moveRecord(Id id, Id anchor, bool after) {
+    Transaction tx(*this);
+    std::vector<std::pair<Id, bool>> order;
+    {
+        Statement q(db_, "SELECT id,is_pinned FROM records ORDER BY is_pinned DESC,(sort_order IS NULL),sort_order,updated_at DESC,id DESC");
+        while (q.next()) order.push_back({q.number(0), q.number(1) != 0});
+    }
+    auto find = [&](Id key) { return std::find_if(order.begin(), order.end(), [key](const auto& row) { return row.first == key; }); };
+    auto from = find(id), target = find(anchor);
+    if (from == order.end() || target == order.end()) throw std::runtime_error("资料已变化，请刷新后重新排序");
+    if (from->second != target->second) throw std::runtime_error("置顶资料和普通资料请分别调整顺序");
+    if (id == anchor) { tx.commit(); return; }
+    auto row = *from; order.erase(from); target = find(anchor); order.insert(target + (after ? 1 : 0), row);
+    Statement update(db_, "UPDATE records SET sort_order=?2 WHERE id=?1");
+    for (size_t i = 0; i < order.size(); ++i) {
+        update.number(1, order[i].first); update.number(2, static_cast<Id>(i)); update.next(); update.reset();
+    }
+    tx.commit();
+}
 std::vector<Group> Database::groups() { Statement q(db_, "SELECT id,name FROM groups ORDER BY sort_order,id"); std::vector<Group> result; while (q.next()) result.push_back({q.number(0), q.text(1)}); return result; }
 Id Database::saveGroup(Id id, const std::wstring& name) {
     if (name.empty()) throw std::runtime_error("分组名称不能为空");

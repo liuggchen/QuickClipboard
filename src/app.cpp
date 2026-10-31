@@ -109,6 +109,7 @@ int App::run(bool hidden) {
     WNDCLASSEXW cls{sizeof(cls)}; cls.lpfnWndProc = windowProc; cls.hInstance = instance_; cls.hCursor = LoadCursorW(nullptr, IDC_ARROW); cls.lpszClassName = className.c_str(); cls.hIcon = icon_; cls.hIconSm = smallIcon_;
     RegisterClassExW(&cls);
     cls.lpszClassName = L"QuickClipboardList"; cls.lpfnWndProc = listProc; cls.hIcon = nullptr; cls.hIconSm = nullptr; RegisterClassExW(&cls);
+    cls.lpszClassName = L"QuickClipboardRecordDrag"; cls.lpfnWndProc = recordGhostProc; RegisterClassExW(&cls);
     constexpr DWORD style = WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     window_ = CreateWindowExW(WS_EX_APPWINDOW, className.c_str(), AppDisplayName, style, CW_USEDEFAULT, CW_USEDEFAULT, px(440), px(548), nullptr, nullptr, instance_, this);
     if (!window_) throw std::runtime_error("无法创建随手贴窗口");
@@ -561,7 +562,8 @@ void App::paintList(HDC dc) {
         const auto& item = items_[i]; int height = itemHeight(item);
         rows_.push_back({y, height}); int top = y - scroll_; y += height + 9;
         if (top + height < 0 || top > viewportHeight_) continue;
-        RECT outer{px(18), px(top), px(w - 18), px(top + height)}; card(dc, outer, selected_ == static_cast<int>(i));
+        bool dragged = recordDrag_.active && recordDrag_.id == item.id;
+        RECT outer{px(18), px(top), px(w - 18), px(top + height)}; card(dc, outer, dragged || selected_ == static_cast<int>(i));
         bool view = expanded_.id == item.id && !draft_ && !appendMode_;
         int headerHeight = !tab_ ? 100 : (view ? RecordHeader : FoldedRecord);
         RECT header{px(18), px(top), px(w - 18), px(top + headerHeight)};
@@ -582,7 +584,8 @@ void App::paintList(HDC dc) {
                     titleRight -= badge + 8;
                 }
             }
-            text(dc, (item.pinned ? L"★ " : L"") + item.title, {px(31), px(top + 8), px(titleRight), px(top + 35)}, bold_, ink_);
+            if (dragged) paintRecordGrip(dc, px(31), px(top + 22));
+            text(dc, (item.pinned ? L"★ " : L"") + item.title, {px(dragged ? 47 : 31), px(top + 8), px(titleRight), px(top + 35)}, bold_, ink_);
             if (!view) text(dc, oneLine(item.subtitle), {px(31), px(top + 34), px(w - 52), px(top + 57)}, small_, muted_);
             text(dc, expanded_.id == item.id ? L"⌄" : L"›", {px(w - 50), px(top + 8), px(w - 26), px(top + 35)}, font_, muted_);
             if (expanded_.id == item.id && !draft_) {
@@ -640,6 +643,7 @@ void App::paintList(HDC dc) {
     if (more_) { RECT r{px(20), px(y + 3 - scroll_), px(w - 20), px(y + 37 - scroll_)}; text(dc, loading_ ? L"正在加载…" : L"加载更多", r, font_, accent_, DT_CENTER | DT_VCENTER | DT_SINGLELINE); hits_.push_back({r, LoadMore, 0}); y += 44; }
     totalHeight_ = y + 8;
     paintForm(dc);
+    if (recordDrag_.active && recordDrag_.anchor) { auto brush = CreateSolidBrush(accent_); FillRect(dc, &recordDrag_.marker, brush); DeleteObject(brush); }
 }
 
 LRESULT App::listMessage(UINT msg, WPARAM wp, LPARAM lp) {
@@ -650,6 +654,7 @@ LRESULT App::listMessage(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_VSCROLL: { SCROLLINFO si{sizeof(si), SIF_TRACKPOS}; GetScrollInfo(list_, SB_VERT, &si); int pos = scroll_; switch (LOWORD(wp)) { case SB_LINEUP: pos -= 28; break; case SB_LINEDOWN: pos += 28; break; case SB_PAGEUP: pos -= viewportHeight_ - 28; break; case SB_PAGEDOWN: pos += viewportHeight_ - 28; break; case SB_THUMBTRACK: pos = si.nTrackPos; break; case SB_TOP: pos = 0; break; case SB_BOTTOM: pos = totalHeight_; break; } setScroll(pos); return 0; }
     case WM_MOUSEWHEEL: setScroll(scroll_ - GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 72); return 0;
     case WM_MOUSEMOVE: {
+        if (recordDrag_.pressed) { moveRecordDrag({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}); return 0; }
         POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}; int kind = 0, index = -1;
         for (auto it = hits_.rbegin(); it != hits_.rend(); ++it) if (PtInRect(&it->rect, point)) { kind = it->action; index = it->index; break; }
         if (kind != hoveredAction_ || index != hoveredIndex_) { hoveredAction_ = kind; hoveredIndex_ = index; SendMessageW(tooltips_, TTM_POP, 0, 0); InvalidateRect(list_, nullptr, FALSE); }
@@ -657,7 +662,29 @@ LRESULT App::listMessage(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSELEAVE: hoveredAction_ = 0; hoveredIndex_ = -1; InvalidateRect(list_, nullptr, FALSE); return 0;
-    case WM_LBUTTONUP: { POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}; for (auto it = hits_.rbegin(); it != hits_.rend(); ++it) if (PtInRect(&it->rect, p)) { auto hit = *it; action(hit.action, hit.index); break; } return 0; }
+    case WM_LBUTTONDOWN: {
+        suppressRecordClick_ = false;
+        if (tab_ == 1 && ready_ && !loading_ && !saving_ && !draft_ && !appendMode_ && !settingsMode_ && !groupsMode_) {
+            POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            for (auto it = hits_.rbegin(); it != hits_.rend(); ++it) if (PtInRect(&it->rect, point)) {
+                if (it->action == Open) {
+                    auto origin = it->rect; origin.bottom = std::min(origin.bottom, origin.top + px(40)); origin.right -= px(40);
+                    if (PtInRect(&origin, point)) { pressRecord(it->index, origin, point); return 0; }
+                }
+                break;
+            }
+        }
+        break;
+    }
+    case WM_LBUTTONUP: {
+        POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (recordDrag_.pressed) { moveRecordDrag(p); finishRecordDrag(true); return 0; }
+        if (suppressRecordClick_) { suppressRecordClick_ = false; return 0; }
+        for (auto it = hits_.rbegin(); it != hits_.rend(); ++it) if (PtInRect(&it->rect, p)) { auto hit = *it; action(hit.action, hit.index); break; } return 0;
+    }
+    case WM_CAPTURECHANGED: if (recordDrag_.pressed && reinterpret_cast<HWND>(lp) != list_) finishRecordDrag(false); return 0;
+    case WM_CANCELMODE: finishRecordDrag(false); return 0;
+    case WM_SETCURSOR: if (recordDrag_.active) { SetCursor(LoadCursorW(nullptr, recordDrag_.anchor ? IDC_SIZEALL : IDC_NO)); return TRUE; } break;
     case WM_CONTEXTMENU: { POINT screen{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, p = screen; if (screen.x == -1) { p = {px(40), px(30)}; screen = p; ClientToScreen(list_, &screen); } else ScreenToClient(list_, &p); for (size_t i = 0; i < rows_.size(); ++i) if (logical(p.y) + scroll_ >= rows_[i].first && logical(p.y) + scroll_ < rows_[i].first + rows_[i].second) { menu(static_cast<int>(i), screen); return 0; } if (selected_ < static_cast<int>(items_.size())) menu(selected_, screen); return 0; }
     case WM_COMMAND: case WM_NOTIFY: case WM_DRAWITEM: case WM_MEASUREITEM: return message(msg, wp, lp);
     case WM_CTLCOLOREDIT: case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLORLISTBOX: return message(msg, wp, lp);
@@ -718,6 +745,7 @@ HWND App::control(const wchar_t* kind, const std::wstring& value, DWORD style, i
 
 void App::refresh(bool append, bool keepExpanded) {
     if (!ready_ || (loading_ && append) || draft_) return;
+    if (!append) finishRecordDrag(false);
     if (!append) { ++revision_; loading_ = false; if (!keepExpanded) collapse(); selected_ = 0; fieldSelected_ = -1; setScroll(0); }
     const int revision = revision_, tab = tab_, offset = append ? static_cast<int>(items_.size()) : 0;
     auto query = windowText(search_); auto group = groupFilter_; loading_ = true;
@@ -849,6 +877,7 @@ void App::error(const std::wstring& value) {
 }
 bool App::leave() {
     if (saving_) return false;
+    finishRecordDrag(false);
     if (dirty_ && !confirm(L"有尚未保存的更改，放弃这些更改吗？")) return false;
     ++revision_; loading_ = false;
     destroyControls(); draft_.reset(); settingsMode_ = groupsMode_ = appendMode_ = false; dirty_ = false; wipe(appendValue_); collapse(); return true;
@@ -1290,6 +1319,7 @@ void App::clearHistory() {
 bool App::key(MSG& msg) {
     if (msg.message != WM_KEYDOWN || GetAncestor(msg.hwnd, GA_ROOT) != window_) return false;
     bool ctrl = GetKeyState(VK_CONTROL) < 0;
+    if (recordDrag_.pressed) { if (msg.wParam == VK_ESCAPE) finishRecordDrag(false); return true; }
     if (msg.wParam == VK_APPS || (msg.wParam == VK_F10 && GetKeyState(VK_SHIFT) < 0)) {
         if (std::find(groupButtons_.begin(), groupButtons_.end(), msg.hwnd) != groupButtons_.end()) { RECT rect{}; GetWindowRect(msg.hwnd, &rect); groupMenu({rect.left, rect.bottom}); return true; }
     }
@@ -1328,6 +1358,7 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
                 if (it->action == Edit) tooltipText_ = L"编辑这条资料";
                 if (it->action == Reveal) tooltipText_ = L"显示或隐藏敏感字段";
                 if (it->action == FullText) tooltipText_ = L"原地展开或收起全文";
+                if (it->action == Open && tab_ == 1 && !draft_ && !appendMode_) tooltipText_ = L"点击展开资料，长按标题拖拽排序";
                 break;
             }
         }
@@ -1353,7 +1384,7 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMPLETE: { std::unique_ptr<std::function<void()>> callback(reinterpret_cast<std::function<void()>*>(lp)); (*callback)(); return 0; }
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: { PAINTSTRUCT ps{}; auto dc = BeginPaint(window_, &ps); RECT r{}; GetClientRect(window_, &r); auto mem = CreateCompatibleDC(dc); auto bitmap = CreateCompatibleBitmap(dc, std::max(1L, r.right), std::max(1L, r.bottom)); auto old = SelectObject(mem, bitmap); paint(mem); BitBlt(dc, 0, 0, r.right, r.bottom, mem, 0, 0, SRCCOPY); SelectObject(mem, old); DeleteObject(bitmap); DeleteDC(mem); EndPaint(window_, &ps); return 0; }
-    case WM_SIZE: layout(); return 0;
+    case WM_SIZE: finishRecordDrag(false); layout(); return 0;
     case WM_GETMINMAXINFO: { auto info = reinterpret_cast<MINMAXINFO*>(lp); info->ptMinTrackSize = {px(400), px(420)}; return 0; }
     case WM_DPICHANGED: { if (draft_) collectDraft(); dpi_ = HIWORD(wp); loadIcons(); fonts(); auto r = reinterpret_cast<RECT*>(lp); SetWindowPos(window_, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE); layout(); return 0; }
     case WM_SETTINGCHANGE: theme(); return 0;
@@ -1363,8 +1394,10 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     case WM_CLOSE: hide(); return 0;
+    case WM_CANCELMODE: finishRecordDrag(false); return 0;
     case WM_SYSCOMMAND: if ((wp & 0xfff0) == SC_MINIMIZE) { hide(); return 0; } break;
     case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE) finishRecordDrag(false);
         // 键盘切换和正常失焦保持可见；只有显式开启的窗外点击才隐藏。
         if (LOWORD(wp) == WA_INACTIVE && settings_.hideOutside && !inMenu_ && !saving_ && IsWindowVisible(window_) && ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000)) {
             auto next = reinterpret_cast<HWND>(lp);
@@ -1374,6 +1407,8 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_HOTKEY: if (hotkeyRegistered_ && wp == static_cast<WPARAM>(hotkeyId_)) show(); return 0;
     case WM_CLIPBOARDUPDATE: captureRetries_ = 0; pendingSequence_ = GetClipboardSequenceNumber(); capture(); return 0;
     case WM_TIMER:
+        if (wp == RecordPressTimer) startRecordDrag();
+        if (wp == RecordDragTimer) recordDragTick();
         if (wp == SearchTimer) { KillTimer(window_, SearchTimer); refresh(); }
         if (wp == CaptureTimer) capture();
         if (wp == SecretTimer) clearSecret();
@@ -1466,6 +1501,8 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_QUERYENDSESSION: return TRUE;
     case WM_ENDSESSION: if (wp) DestroyWindow(window_); return 0;
     case WM_DESTROY: {
+        finishRecordDrag(false);
+        if (recordGhost_) { DestroyWindow(recordGhost_); recordGhost_ = nullptr; }
         winVHotkey_.stop();
         if (worker_) worker_->stop();
         clearSecret();

@@ -17,8 +17,19 @@ public:
     static LRESULT CALLBACK windowProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK listProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK controlProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+    static LRESULT CALLBACK recordGhostProc(HWND, UINT, WPARAM, LPARAM);
 private:
     struct Hit { RECT rect; int action; int index; };
+    struct RecordDrag {
+        bool pressed{}, active{}, after{};
+        Id id{}, anchor{};
+        POINT start{}, point{};
+        RECT origin{}, marker{};
+    };
+    static constexpr UINT RecordPressTimer = 8, RecordDragTimer = 9;
+    RecordDrag recordDrag_;
+    HWND recordGhost_{};
+    bool suppressRecordClick_{};
     enum class ControlKind { Plain, Edit, Multiline, Combo, Hotkey, Check, Button };
     struct Control { HWND window; int x; int y; int width; int height; ControlKind kind = ControlKind::Plain; };
     struct FieldLayout {
@@ -108,6 +119,16 @@ private:
     void selectGroup(Id id);
     // 更多菜单和分组右键菜单共用选择与管理入口。
     void groupMenu(POINT point = {-1, -1});
+    // 长按资料标题进入排序，普通单击仍展开或收起卡片。
+    void pressRecord(int index, RECT origin, POINT point);
+    void startRecordDrag();
+    // 计算卡片间的插入线，拖动到列表边缘时滚动并按需加载下一页。
+    void moveRecordDrag(POINT point);
+    void recordDragTick();
+    // 有效松手后保存资料顺序，取消和保存失败均保留原顺序。
+    void finishRecordDrag(bool drop);
+    void paintRecordGhost(HDC dc);
+    void paintRecordGrip(HDC dc, int x, int y);
     // 设置主题、状态或布局变化后同步刷新父子区域，清除旧背景。
     void redraw();
     void paintButton(const DRAWITEMSTRUCT& draw);

@@ -32,6 +32,8 @@ public:
     void removeRecord(Id id);
     void pin(Id id, bool pinned);
     void used(Id id);
+    // 将资料移动到另一条资料前后，置顶与普通资料分别排序。
+    void moveRecord(Id id, Id anchor, bool after);
     std::vector<Group> groups();
     Id saveGroup(Id id, const std::wstring& name);
     void removeGroup(Id id);
