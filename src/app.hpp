@@ -24,7 +24,7 @@ private:
     static constexpr int CopyQrValue = 9;
     static constexpr int CopyQrId = 10;
     static constexpr int SaveQrImage = 11;
-    static constexpr int QrInput = 113, QrRecognize = 114, QrGenerate = 115;
+    static constexpr int QrInput = 113, QrRecognize = 114, QrGenerate = 115, QrSelectImage = 116;
     static constexpr UINT QrGenerateTimer = 10;
     struct RecordDrag {
         bool pressed{}, active{}, after{};
@@ -73,7 +73,7 @@ private:
     std::wstring qrMessage_;
     std::vector<QrValue> qrValues_;
     std::vector<QrLayout> qrLayouts_;
-    HWND qrInput_{}, qrRecognizeButton_{}, qrGenerateButton_{};
+    HWND qrInput_{}, qrRecognizeButton_{}, qrGenerateButton_{}, qrSelectImageButton_{};
     bool qrGenerateMode_{}, qrGenerating_{}, qrComposing_{};
     std::uint64_t qrGenerateRevision_{};
     std::wstring qrText_;
@@ -126,6 +126,8 @@ private:
     void stopQr();
     // 在二维码页主动读取当前剪贴板图片，读取失败时保留已有结果。
     void pasteQrImage();
+    // 通过系统对话框选择一张本地图片，沿用后台识别流程。
+    void selectQrImage();
     // 将粘贴和拖放的数据交给同一识别流程，并提示不支持的输入。
     void receiveQrImage(IDataObject* data);
     // 按最新图片更新识别结果，忽略已被后续输入替代的结果。

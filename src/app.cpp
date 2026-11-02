@@ -139,6 +139,7 @@ LRESULT CALLBACK App::listProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
     if (!app) return DefWindowProcW(window, msg, wp, lp);
     try { return app->listMessage(msg, wp, lp); } catch (const std::exception& e) { app->error(errorText(e)); return 0; }
 }
+// 保留原生控件操作，并统一处理输入提示、焦点与按钮悬停反馈。
 LRESULT CALLBACK App::controlProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
     auto app = reinterpret_cast<App*>(ref);
     if (window == app->qrInput_ && (msg == WM_IME_STARTCOMPOSITION || msg == WM_IME_ENDCOMPOSITION)) {
@@ -188,7 +189,11 @@ LRESULT CALLBACK App::controlProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, U
     }
     if ((combo || check || hotkey) && msg == WM_ERASEBKGND) return 1;
     if (hotkey && msg == WM_NCPAINT) return 0;
-    if (GetParent(window) == app->window_ || combo || check || button) {
+    bool qrLink = window == app->qrSelectImageButton_;
+    if (qrLink && msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT && IsWindowEnabled(window)) {
+        SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE;
+    }
+    if (GetParent(window) == app->window_ || combo || check || button || qrLink) {
         if (msg == WM_MOUSEMOVE && app->hoveredButton_ != window) {
             auto previous = app->hoveredButton_; app->hoveredButton_ = window;
             TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0}; TrackMouseEvent(&track);
@@ -309,7 +314,7 @@ void App::fonts() {
     for (HFONT f : {font_, bold_, titleFont_, small_}) if (f) DeleteObject(f);
     auto create = [&](int height, int weight) { return CreateFontW(-px(height), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI"); };
     font_ = create(13, FW_NORMAL); bold_ = create(13, FW_SEMIBOLD); titleFont_ = create(14, FW_SEMIBOLD); small_ = create(11, FW_NORMAL);
-    for (auto w : {historyTab_, recordsTab_, qrTab_, settingsButton_, minimizeButton_, closeButton_, groupMore_, new_, search_, searchClear_, historyClear_, footerSave_, footerCancel_, qrInput_, qrRecognizeButton_, qrGenerateButton_}) if (w) SendMessageW(w, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+    for (auto w : {historyTab_, recordsTab_, qrTab_, settingsButton_, minimizeButton_, closeButton_, groupMore_, new_, search_, searchClear_, historyClear_, footerSave_, footerCancel_, qrInput_, qrRecognizeButton_, qrGenerateButton_, qrSelectImageButton_}) if (w) SendMessageW(w, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     for (auto w : groupButtons_) if (w) SendMessageW(w, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     for (auto& c : controls_) {
         SendMessageW(c.window, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
@@ -443,7 +448,7 @@ void App::paint(HDC dc) {
         text(dc, saving_ ? L"正在保存…" : (draft_ ? (dirty_ ? L"● 未保存" : L"编辑资料") : (appendMode_ ? L"选择资料后添加字段" : L"")), {px(20), h - px(46), w - px(180), h - px(14)}, small_, muted_);
     } else {
         auto divider = CreateSolidBrush(line_); RECT line{px(20), h - px(35), w - px(20), h - px(34)}; FillRect(dc, &line, divider); DeleteObject(divider);
-        auto hint = qrPage() ? (qrGenerateMode_ ? L"点击二维码，选择位置保存" : L"Ctrl + V 粘贴图片 · 拖入图片") : (settings_.paused ? L"记录已暂停  ·  Esc 隐藏" : L"↑↓ 选择   Enter 操作   Esc 隐藏");
+        auto hint = qrPage() ? (qrGenerateMode_ ? L"点击二维码，选择位置保存" : L"Ctrl + V · 拖拽 · 选择图片") : (settings_.paused ? L"记录已暂停  ·  Esc 隐藏" : L"↑↓ 选择   Enter 操作   Esc 隐藏");
         text(dc, status_.empty() ? hint : status_, {px(20), h - px(32), w - px(qrPage() ? 118 : (tab_ ? 20 : 120)), h - px(4)}, small_, muted_);
         if (qrPage()) text(dc, L"·", {w - px(66), h - px(31), w - px(58), h - px(5)}, small_, muted_, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
@@ -460,6 +465,8 @@ void App::paintButton(const DRAWITEMSTRUCT& draw) {
     FillRect(dc, &rect, id == SearchClear || (formButton && draft_) ? cardBrush_ : background_);
     bool activeTab = (id == HistoryTab && tab_ == 0) || (id == RecordsTab && tab_ == 1) || (id == QrTab && tab_ == 2);
     bool qrMode = id == QrRecognize || id == QrGenerate;
+    bool qrLink = id == QrSelectImage;
+    bool qrTextButton = qrMode || qrLink;
     bool activeQrMode = (id == QrRecognize && !qrGenerateMode_) || (id == QrGenerate && qrGenerateMode_);
     bool activeGroup = id >= GroupFilterBase && static_cast<size_t>(id - GroupFilterBase) < visibleGroups_.size() && filters_[visibleGroups_[id - GroupFilterBase]].id == groupFilter_;
     if (id == GroupMore) activeGroup = false;
@@ -472,7 +479,7 @@ void App::paintButton(const DRAWITEMSTRUCT& draw) {
     COLORREF fill = primary ? (hot ? RGB(6, 174, 86) : accentFill_) : (activeGroup ? accentTint_ : (hot ? (dark_ ? RGB(42, 42, 42) : RGB(239, 239, 239)) : card_));
     if (closeHot) fill = RGB(211, 53, 67);
     if (danger && hot) fill = dark_ ? RGB(70, 38, 45) : RGB(255, 237, 239);
-    if (!qrMode && (primary || activeGroup || hot || formButton)) {
+    if (!qrTextButton && (primary || activeGroup || hot || formButton)) {
         auto brush = CreateSolidBrush(fill); auto border = CreatePen(PS_SOLID, px(1), formButton && !primary ? line_ : fill);
         auto oldBrush = SelectObject(dc, brush); auto oldPen = SelectObject(dc, border);
         RoundRect(dc, 1, 1, width - 1, height - 1, px(8), px(8));
@@ -482,7 +489,8 @@ void App::paintButton(const DRAWITEMSTRUCT& draw) {
     if (formButton && !primary) color = ink_;
     if (danger && hot) color = dark_ ? RGB(255, 150, 160) : RGB(193, 52, 68);
     if (!enabled) color = muted_;
-    if (qrMode && enabled) color = activeQrMode || hot ? accent_ : muted_;
+    if (qrTextButton && enabled) color = activeQrMode || hot ? accent_ : muted_;
+    if (qrLink && enabled) color = hot ? (dark_ ? RGB(6, 174, 86) : RGB(5, 145, 72)) : accent_;
     if (id == Minimize || id == Close || id == SearchClear) {
         HPEN pen = CreatePen(PS_SOLID, px(1), color); auto oldPen = SelectObject(dc, pen);
         int cx = width / 2, cy = height / 2, radius = px(4);
@@ -499,9 +507,23 @@ void App::paintButton(const DRAWITEMSTRUCT& draw) {
         text(dc, L"清空历史", {px(25), 0, width - px(4), height}, small_, color);
     } else {
         RECT label = rect; InflateRect(&label, -px(5), 0);
-        text(dc, windowText(draw.hwndItem), label, qrMode ? small_ : (activeTab ? bold_ : font_), color, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        auto value = windowText(draw.hwndItem);
+        auto font = qrMode ? small_ : (activeTab ? bold_ : font_);
+        text(dc, value, label, font, color, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (qrLink) {
+            auto oldFont = SelectObject(dc, font); SIZE size{};
+            GetTextExtentPoint32W(dc, value.data(), static_cast<int>(value.size()), &size);
+            SelectObject(dc, oldFont);
+            int lineWidth = std::min(size.cx, label.right - label.left);
+            int left = (width - lineWidth) / 2, top = std::min(height - px(2), (height + static_cast<int>(size.cy)) / 2);
+            RECT underline{left, top, left + lineWidth, top + 1};
+            auto brush = CreateSolidBrush(color); FillRect(dc, &underline, brush); DeleteObject(brush);
+        }
     }
-    if (activeQrMode || ((draw.itemState & ODS_FOCUS) && !(draw.itemState & ODS_NOFOCUSRECT))) {
+    bool focused = (draw.itemState & ODS_FOCUS) && !(draw.itemState & ODS_NOFOCUSRECT);
+    if (qrLink && focused) {
+        RECT focus = rect; InflateRect(&focus, -px(4), -px(4)); DrawFocusRect(dc, &focus);
+    } else if (activeQrMode || focused) {
         RECT focus{width / 2 - px(8), height - px(3), width / 2 + px(8), height - px(2)};
         auto brush = CreateSolidBrush(color); FillRect(dc, &focus, brush); DeleteObject(brush);
     }
@@ -582,6 +604,7 @@ void App::updateListMetrics() {
         // 滚动条显隐会改变字段宽度，立即用最终可视宽度重算一次。
         if (before.right == after.right) break;
     }
+    layoutQrControls();
 }
 
 // 列表只绘制可视卡片；完整字段仅在展开一条资料时取出。
@@ -734,7 +757,7 @@ LRESULT App::listMessage(UINT msg, WPARAM wp, LPARAM lp) {
 void App::setScroll(int position) {
     int next = std::clamp(position, 0, std::max(0, totalHeight_ - viewportHeight_));
     if (scroll_ == next) return;
-    scroll_ = next; SetScrollPos(list_, SB_VERT, scroll_, TRUE); positionControls(); InvalidateRect(list_, nullptr, TRUE);
+    scroll_ = next; SetScrollPos(list_, SB_VERT, scroll_, TRUE); positionControls(); layoutQrControls(); InvalidateRect(list_, nullptr, TRUE);
     hits_.clear(); hoveredAction_ = 0; hoveredIndex_ = -1; SendMessageW(tooltips_, TTM_POP, 0, 0);
 }
 void App::ensureVisible(int index) {
@@ -1487,6 +1510,7 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
         else if (id == RecordsTab) switchTab(1);
         else if (id == QrTab) switchTab(2);
         else if (id == QrRecognize || id == QrGenerate) switchQrMode(id == QrGenerate);
+        else if (id == QrSelectImage && notification == BN_CLICKED) selectQrImage();
         else if (id == Minimize || id == Close) hide();
         else if (id >= GroupFilterBase && static_cast<size_t>(id - GroupFilterBase) < visibleGroups_.size() && GetParent(reinterpret_cast<HWND>(lp)) == window_) selectGroup(filters_[visibleGroups_[id - GroupFilterBase]].id);
         else if (id == GroupMore) groupMenu();

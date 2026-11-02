@@ -22,6 +22,6 @@ try {
         Copy-Item assets\screenshots\*.png dist\assets\screenshots -Force
         $packageFiles += 'dist\assets'
     }
-    Compress-Archive -Path $packageFiles -DestinationPath dist\QuickClipboard-1.1.0-win-x64.zip -Force
+    Compress-Archive -Path $packageFiles -DestinationPath dist\QuickClipboard-1.1.1-win-x64.zip -Force
     Write-Host "已生成 $projectRoot\dist\QuickClipboard.exe"
 } finally { Pop-Location }

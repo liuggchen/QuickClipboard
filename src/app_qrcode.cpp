@@ -9,16 +9,17 @@
 namespace qc {
 
 void App::initializeQr() {
-    auto button = [&](const wchar_t* label, int id) {
-        auto handle = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
+    auto button = [&](const wchar_t* label, int id, HWND parent) {
+        auto handle = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
         SendMessageW(handle, WM_SETFONT, reinterpret_cast<WPARAM>(small_), 0);
         SetWindowSubclass(handle, controlProc, 1, reinterpret_cast<DWORD_PTR>(this)); return handle;
     };
-    qrRecognizeButton_ = button(L"识别", QrRecognize); qrGenerateButton_ = button(L"生成", QrGenerate);
+    qrRecognizeButton_ = button(L"识别", QrRecognize, window_); qrGenerateButton_ = button(L"生成", QrGenerate, window_);
+    qrSelectImageButton_ = button(L"选择图片", QrSelectImage, list_);
     // 纯文本 Rich Edit 按内容自动显隐滚动条，空内容和短文本不占用右侧空间。
     qrInput_ = CreateWindowExW(0, MSFTEDIT_CLASS, L"", WS_CHILD | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
         0, 0, 0, 0, list_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(QrInput)), instance_, nullptr);
-    if (!qrInput_ || !qrRecognizeButton_ || !qrGenerateButton_) throw std::runtime_error("二维码界面创建失败。");
+    if (!qrInput_ || !qrRecognizeButton_ || !qrGenerateButton_ || !qrSelectImageButton_) throw std::runtime_error("二维码界面创建失败。");
     SendMessageW(qrInput_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), 0);
     SendMessageW(qrInput_, EM_SETLIMITTEXT, 1000000, 0);
     SendMessageW(qrInput_, EM_SETTEXTMODE, TM_PLAINTEXT, 0);
@@ -30,7 +31,7 @@ void App::initializeQr() {
     qrWorker_ = std::make_unique<QrWorker>(window_);
     qrDropTarget_ = createQrDropTarget([this] { return qrRecognitionPage() && ready_ && !saving_; },
         [this](IDataObject* data) { receiveQrImage(data); },
-        [this](bool active) { if (qrDragging_ != active) { qrDragging_ = active; InvalidateRect(list_, nullptr, FALSE); } });
+        [this](bool active) { if (qrDragging_ != active) { qrDragging_ = active; layoutQrControls(); InvalidateRect(list_, nullptr, FALSE); } });
     if (FAILED(RegisterDragDrop(window_, qrDropTarget_)) || FAILED(RegisterDragDrop(list_, qrDropTarget_)))
         throw std::runtime_error("图片拖放注册失败。");
 }
@@ -50,6 +51,34 @@ void App::pasteQrImage() {
     Microsoft::WRL::ComPtr<IDataObject> data;
     if (FAILED(OleGetClipboard(&data))) { notice(L"剪贴板暂时无法读取，请稍后再按 Ctrl + V。"); return; }
     receiveQrImage(data.Get());
+}
+
+void App::selectQrImage() {
+    if (!qrRecognitionPage() || !ready_ || saving_) return;
+    try {
+        Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
+        if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog))))
+            throw std::runtime_error("无法打开图片选择对话框。");
+        COMDLG_FILTERSPEC types[]{{L"图片文件 (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.ico;*.webp)", L"*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.ico;*.webp"},
+                                 {L"所有文件 (*.*)", L"*.*"}};
+        FILEOPENDIALOGOPTIONS options{};
+        if (FAILED(dialog->GetOptions(&options)) || FAILED(dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR)) ||
+            FAILED(dialog->SetFileTypes(2, types)) || FAILED(dialog->SetTitle(L"选择二维码图片")))
+            throw std::runtime_error("无法设置图片选择对话框。");
+        auto result = dialog->Show(window_);
+        if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) { SetFocus(qrFocus()); return; }
+        if (FAILED(result)) throw std::runtime_error("无法选择图片。");
+        Microsoft::WRL::ComPtr<IShellItem> item;
+        if (FAILED(dialog->GetResult(&item))) throw std::runtime_error("无法读取所选图片。");
+        PWSTR path{};
+        if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) throw std::runtime_error("请选择本地图片文件。");
+        struct Free { PWSTR value; ~Free() { CoTaskMemFree(value); } } free{path};
+        QrImage image; image.file = path; scanQrImage(std::move(image));
+    } catch (const std::exception& e) {
+        notice(errorText(e));
+        if (qrValues_.empty() && !qrScanning_) { qrMessage_ = errorText(e); InvalidateRect(list_, nullptr, FALSE); }
+    }
+    SetFocus(qrFocus());
 }
 
 void App::receiveQrImage(IDataObject* data) {
@@ -109,15 +138,17 @@ void App::paintQrResults(HDC dc) {
         return;
     }
     if (qrValues_.empty()) {
-        int middle = std::max(70, viewportHeight_ / 2 - 35);
-        auto title = qrScanning_ ? L"正在识别图片…" : L"粘贴或拖入图片";
+        int middle = std::max(20, viewportHeight_ / 2 - 75);
+        auto title = qrScanning_ ? L"正在识别图片…" : L"解码二维码图片";
         text(dc, title, {px(20), px(middle), client.right - px(20), px(middle + 30)}, titleFont_, ink_, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        auto hint = qrScanning_ ? L"可以继续粘贴或拖入新图片" : (qrMessage_.empty() ? L"Ctrl + V 粘贴剪贴板图片，或拖入图片文件" : qrMessage_.c_str());
-        text(dc, hint, {px(28), px(middle + 43), client.right - px(28), px(middle + 104)}, font_, muted_, DT_CENTER | DT_TOP | DT_WORDBREAK);
+        text(dc, L"Ctrl + V 粘贴图片", {px(28), px(middle + 43), client.right - px(28), px(middle + 70)}, font_, muted_, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        text(dc, L"拖拽图片到此处", {px(28), px(middle + 71), client.right - px(28), px(middle + 98)}, font_, muted_, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (!qrMessage_.empty() && !qrScanning_)
+            text(dc, qrMessage_, {px(28), px(middle + 138), client.right - px(28), px(middle + 199)}, font_, muted_, DT_CENTER | DT_TOP | DT_WORDBREAK);
         return;
     }
     auto title = L"识别到 " + std::to_wstring(qrValues_.size()) + L" 个二维码 · 点击内容复制";
-    text(dc, title, {px(20), px(6 - scroll_), client.right - px(20), px(32 - scroll_)}, small_, muted_);
+    text(dc, title, {px(20), px(6 - scroll_), client.right - px(118), px(32 - scroll_)}, small_, muted_);
     for (size_t i = 0; i < qrValues_.size() && i < qrLayouts_.size() && i < rows_.size(); ++i) {
         const auto& shape = qrLayouts_[i]; int top = rows_[i].first - scroll_;
         if (top + shape.height < 0 || top > viewportHeight_) continue;
@@ -159,7 +190,7 @@ void App::switchQrMode(bool generate) {
     layout(); SetFocus(qrFocus());
 }
 
-// 输入区跟随窗口宽度，底部文字切换保持在页面右侧。
+// 选择图片入口在空页居中、结果页随标题滚动，底部模式切换保持在右侧。
 void App::layoutQrControls() {
     bool visible = qrPage();
     ShowWindow(qrRecognizeButton_, visible ? SW_SHOW : SW_HIDE);
@@ -171,6 +202,13 @@ void App::layoutQrControls() {
     MoveWindow(qrGenerateButton_, client.right - px(58), client.bottom - px(31), px(40), px(26), TRUE);
     GetClientRect(list_, &client);
     MoveWindow(qrInput_, px(32), px(20), std::max(px(40), static_cast<int>(client.right) - px(64)), px(66), TRUE);
+    bool empty = qrValues_.empty();
+    int width = px(empty ? 112 : 90);
+    int left = empty ? (client.right - width) / 2 : client.right - px(18) - width;
+    int top = empty ? std::max(20, viewportHeight_ / 2 - 75) + 99 : 2 - scroll_;
+    MoveWindow(qrSelectImageButton_, left, px(top), width, px(empty ? 27 : 34), TRUE);
+    ShowWindow(qrSelectImageButton_, qrRecognitionPage() && !qrDragging_ && (empty || top + 34 > 0) ? SW_SHOW : SW_HIDE);
+    EnableWindow(qrSelectImageButton_, ready_ && !saving_);
 }
 
 void App::qrInputChanged() {
