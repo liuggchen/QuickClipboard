@@ -2,6 +2,7 @@
 #include "database.hpp"
 #include "hotkey.hpp"
 #include "ui.hpp"
+#include "qrcode.hpp"
 #include <commctrl.h>
 #include <memory>
 #include <map>
@@ -20,6 +21,11 @@ public:
     static LRESULT CALLBACK recordGhostProc(HWND, UINT, WPARAM, LPARAM);
 private:
     struct Hit { RECT rect; int action; int index; };
+    static constexpr int CopyQrValue = 9;
+    static constexpr int CopyQrId = 10;
+    static constexpr int SaveQrImage = 11;
+    static constexpr int QrInput = 113, QrRecognize = 114, QrGenerate = 115;
+    static constexpr UINT QrGenerateTimer = 10;
     struct RecordDrag {
         bool pressed{}, active{}, after{};
         Id id{}, anchor{};
@@ -39,9 +45,14 @@ private:
         bool expandable{};
         std::vector<std::pair<size_t, size_t>> lines;
     };
+    struct QrLayout {
+        FieldLayout original;
+        FieldLayout id;
+        int height{};
+    };
     HINSTANCE instance_;
     std::filesystem::path dir_;
-    HWND window_{}, list_{}, search_{}, searchClear_{}, historyClear_{}, historyTab_{}, recordsTab_{}, new_{}, settingsButton_{}, minimizeButton_{}, closeButton_{}, groupMore_{}, footerSave_{}, footerCancel_{};
+    HWND window_{}, list_{}, search_{}, searchClear_{}, historyClear_{}, historyTab_{}, recordsTab_{}, qrTab_{}, new_{}, settingsButton_{}, minimizeButton_{}, closeButton_{}, groupMore_{}, footerSave_{}, footerCancel_{};
     HWND hoveredButton_{};
     HWND tooltips_{};
     std::vector<HWND> groupButtons_;
@@ -55,6 +66,18 @@ private:
     UINT dpi_ = 96;
     COLORREF bg_{}, card_{}, ink_{}, muted_{}, line_{}, accent_{}, accentFill_{}, accentInk_{}, accentTint_{};
     std::unique_ptr<Worker> worker_;
+    std::unique_ptr<QrWorker> qrWorker_;
+    IDropTarget* qrDropTarget_{};
+    bool oleInitialized_{}, qrScanning_{}, qrDragging_{};
+    std::uint64_t qrRevision_{};
+    std::wstring qrMessage_;
+    std::vector<QrValue> qrValues_;
+    std::vector<QrLayout> qrLayouts_;
+    HWND qrInput_{}, qrRecognizeButton_{}, qrGenerateButton_{};
+    bool qrGenerateMode_{}, qrGenerating_{}, qrComposing_{};
+    std::uint64_t qrGenerateRevision_{};
+    std::wstring qrText_;
+    QrCode qrCode_;
     Settings settings_;
     std::vector<Item> items_;
     std::vector<Group> groups_;
@@ -95,6 +118,33 @@ private:
     LRESULT message(UINT, WPARAM, LPARAM);
     LRESULT listMessage(UINT, WPARAM, LPARAM);
     void initialize();
+    bool qrPage() const { return tab_ == 2 && !settingsMode_ && !groupsMode_ && !draft_ && !appendMode_; }
+    bool qrRecognitionPage() const { return qrPage() && !qrGenerateMode_; }
+    HWND qrFocus() const { return qrPage() ? (qrGenerateMode_ ? qrInput_ : list_) : search_; }
+    // 初始化二维码识别、生成输入与模式切换，内容仅保存在内存中。
+    void initializeQr();
+    void stopQr();
+    // 在二维码页主动读取当前剪贴板图片，读取失败时保留已有结果。
+    void pasteQrImage();
+    // 将粘贴和拖放的数据交给同一识别流程，并提示不支持的输入。
+    void receiveQrImage(IDataObject* data);
+    // 按最新图片更新识别结果，忽略已被后续输入替代的结果。
+    void scanQrImage(QrImage image);
+    // 分别测量原始值和 ID 行，长内容完整换行并纳入滚动区域。
+    void measureQrResults();
+    // 显示识别结果；原始值和匹配到的 ID 分行展示，各自点击复制。
+    void paintQrResults(HDC dc);
+    void copyQrResult(int index, bool id);
+    // 切换识别和生成视图，保留各自输入与结果。
+    void switchQrMode(bool generate);
+    void layoutQrControls();
+    // 输入变化立即撤下旧图，停止输入后再异步生成，防止保存过期内容。
+    void qrInputChanged();
+    void generateQrPreview();
+    // 整数倍绘制黑白二维码，避免缩放插值模糊；图片本身是保存入口。
+    void paintQrGenerated(HDC dc);
+    // 点击图片后通过系统对话框选择保存位置，按当前内容预填文件名。
+    void saveQrImage();
     void theme();
     void fonts();
     // 从嵌入的多尺寸资源加载窗口与托盘图标，并跟随显示缩放更新。

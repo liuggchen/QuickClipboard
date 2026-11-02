@@ -15,12 +15,13 @@ try {
     New-Item -ItemType Directory -Force dist | Out-Null
     Copy-Item "$BuildDir\Release\QuickClipboard.exe" dist\QuickClipboard.exe -Force
     Copy-Item README.md dist\README.md -Force
-    $packageFiles = @('dist\QuickClipboard.exe', 'dist\README.md')
+    Copy-Item THIRD_PARTY_NOTICES.txt dist\THIRD_PARTY_NOTICES.txt -Force
+    $packageFiles = @('dist\QuickClipboard.exe', 'dist\README.md', 'dist\THIRD_PARTY_NOTICES.txt')
     if (Test-Path -LiteralPath assets\screenshots) {
         New-Item -ItemType Directory -Force dist\assets\screenshots | Out-Null
         Copy-Item assets\screenshots\*.png dist\assets\screenshots -Force
         $packageFiles += 'dist\assets'
     }
-    Compress-Archive -Path $packageFiles -DestinationPath dist\QuickClipboard-1.0.0-win-x64.zip -Force
+    Compress-Archive -Path $packageFiles -DestinationPath dist\QuickClipboard-1.1.0-win-x64.zip -Force
     Write-Host "已生成 $projectRoot\dist\QuickClipboard.exe"
 } finally { Pop-Location }

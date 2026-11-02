@@ -5,12 +5,13 @@
 #include <shellapi.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <ole2.h>
 #include <algorithm>
 #include <stdexcept>
 
 namespace qc {
 namespace {
-constexpr int HistoryTab = 101, RecordsTab = 102, Search = 103, New = 105, SettingsButton = 106, Minimize = 107, Close = 108, GroupMore = 109, SearchClear = 110, HistoryClear = 111, GroupFilterBase = 10000;
+constexpr int HistoryTab = 101, RecordsTab = 102, Search = 103, New = 105, SettingsButton = 106, Minimize = 107, Close = 108, GroupMore = 109, SearchClear = 110, HistoryClear = 111, QrTab = 112, GroupFilterBase = 10000;
 constexpr int Name = 200, GroupCombo = 201, Note = 202, AddField = 203, Save = 204, Cancel = 205, DeleteRecord = 206;
 constexpr int FieldBase = 1000;
 constexpr int Open = 1, PasteField = 2, CopyField = 3, Reveal = 4, Edit = 5, LoadMore = 6, Append = 7, FullText = 8;
@@ -70,6 +71,7 @@ DWORD integrity(HANDLE process) {
 
 App::App(HINSTANCE instance, std::filesystem::path dir) : instance_(instance), dir_(std::move(dir)) {}
 App::~App() {
+    stopQr();
     winVHotkey_.stop();
     if (worker_) worker_->stop();
     MSG msg{};
@@ -84,6 +86,7 @@ App::~App() {
     if (icon_) DestroyIcon(icon_);
     if (smallIcon_) DestroyIcon(smallIcon_);
     if (richEdit_) FreeLibrary(richEdit_);
+    if (oleInitialized_) OleUninitialize();
 }
 void App::loadIcons() {
     auto nextLarge = static_cast<HICON>(LoadImageW(instance_, MAKEINTRESOURCEW(1), IMAGE_ICON, px(32), px(32), 0));
@@ -101,6 +104,8 @@ void App::loadIcons() {
 }
 int App::run(bool hidden) {
     silentLaunch_ = hidden;
+    if (FAILED(OleInitialize(nullptr))) throw std::runtime_error("无法初始化图片剪贴板和拖放支持。");
+    oleInitialized_ = true;
     INITCOMMONCONTROLSEX common{sizeof(common), ICC_STANDARD_CLASSES | ICC_HOTKEY_CLASS}; InitCommonControlsEx(&common);
     richEdit_ = LoadLibraryW(L"Msftedit.dll");
     if (!richEdit_) throw std::runtime_error("Windows Rich Edit 控件无法加载");
@@ -136,20 +141,31 @@ LRESULT CALLBACK App::listProc(HWND window, UINT msg, WPARAM wp, LPARAM lp) {
 }
 LRESULT CALLBACK App::controlProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
     auto app = reinterpret_cast<App*>(ref);
+    if (window == app->qrInput_ && (msg == WM_IME_STARTCOMPOSITION || msg == WM_IME_ENDCOMPOSITION)) {
+        app->qrComposing_ = msg == WM_IME_STARTCOMPOSITION;
+        auto result = DefSubclassProc(window, msg, wp, lp);
+        app->qrInputChanged(); return result;
+    }
     if (window == app->search_ && (msg == WM_IME_STARTCOMPOSITION || msg == WM_IME_ENDCOMPOSITION)) {
         // 输入法组合期间由原生控件绘制，避免提示文字遮挡未提交的中文。
         app->searchComposing_ = msg == WM_IME_STARTCOMPOSITION; InvalidateRect(window, nullptr, FALSE);
     }
-    // 保留原生搜索框的输入和辅助说明，只统一空内容提示的主题颜色。
-    if (window == app->search_ && msg == WM_PAINT) {
+    // 保留原生输入行为，空内容提示与应用主题一致，二维码输入不需要额外标签。
+    if ((window == app->search_ || window == app->qrInput_) && msg == WM_PAINT) {
         auto result = DefSubclassProc(window, msg, wp, lp);
-        if (!GetWindowTextLengthW(window) && !app->searchComposing_) {
+        bool qr = window == app->qrInput_;
+        if (!GetWindowTextLengthW(window) && !(qr ? app->qrComposing_ : app->searchComposing_)) {
             bool focused = GetFocus() == window; if (focused) HideCaret(window);
             auto dc = GetDC(window); RECT rect{}; GetClientRect(window, &rect); FillRect(dc, &rect, app->cardBrush_);
-            app->text(dc, app->tab_ ? L"搜索名称、分组或普通字段…" : L"搜索剪贴板历史…", rect, app->font_, app->muted_);
+            auto hint = qr ? L"输入或粘贴文字、网址，自动生成二维码" : (app->tab_ ? L"搜索名称、分组或普通字段…" : L"搜索剪贴板历史…");
+            app->text(dc, hint, rect, app->font_, app->muted_, qr ? DT_LEFT | DT_TOP | DT_WORDBREAK : DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             ReleaseDC(window, dc); if (focused) ShowCaret(window);
         }
         return result;
+    }
+    if (window == app->qrInput_) {
+        if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS) { InvalidateRect(app->list_, nullptr, FALSE); InvalidateRect(window, nullptr, FALSE); }
+        return DefSubclassProc(window, msg, wp, lp);
     }
     auto form = std::find_if(app->controls_.begin(), app->controls_.end(), [window](const Control& c) { return c.window == window; });
     bool combo = form != app->controls_.end() && form->kind == ControlKind::Combo;
@@ -206,7 +222,7 @@ LRESULT CALLBACK App::controlProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, U
         if (msg == WM_CAPTURECHANGED) app->dragIndex_ = -1;
     }
     if (msg == WM_MOUSEWHEEL) return SendMessageW(app->list_, msg, wp, lp);
-    if (msg == WM_SETFOCUS) {
+    if (msg == WM_SETFOCUS && GetParent(window) == app->list_) {
         RECT r{}; GetWindowRect(window, &r); MapWindowPoints(nullptr, app->list_, reinterpret_cast<POINT*>(&r), 2);
         RECT view{}; GetClientRect(app->list_, &view);
         if (r.top < 0) app->setScroll(app->scroll_ + app->logical(r.top) - 8);
@@ -220,6 +236,7 @@ void App::initialize() {
     theme(); fonts();
     auto button = [&](const wchar_t* label, int id) { auto w = CreateWindowExW(0, L"BUTTON", label, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr); SendMessageW(w, WM_SETFONT, reinterpret_cast<WPARAM>(font_), 0); SetWindowSubclass(w, controlProc, 1, reinterpret_cast<DWORD_PTR>(this)); return w; };
     historyTab_ = button(L"剪贴板历史", HistoryTab); recordsTab_ = button(L"常用资料", RecordsTab); settingsButton_ = button(L"设置", SettingsButton); new_ = button(L"+ 新建", New);
+    qrTab_ = button(L"二维码", QrTab);
     minimizeButton_ = button(L"最小化", Minimize); closeButton_ = button(L"关闭", Close); groupMore_ = button(L"更多 ▾", GroupMore);
     footerSave_ = button(L"保存", Save); footerCancel_ = button(L"取消", Cancel);
     searchClear_ = button(L"清除搜索", SearchClear); historyClear_ = button(L"清空历史", HistoryClear);
@@ -228,6 +245,7 @@ void App::initialize() {
     SendMessageW(search_, WM_SETFONT, reinterpret_cast<WPARAM>(font_), 0); SendMessageW(search_, EM_SETLIMITTEXT, 512, 0);
     list_ = CreateWindowExW(WS_EX_CONTROLPARENT, L"QuickClipboardList", L"记录列表", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_CLIPCHILDREN, 0, 0, 0, 0, window_, nullptr, instance_, this);
     if (!list_ || !search_) throw std::runtime_error("原生界面控件创建失败");
+    initializeQr();
     tooltips_ = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, window_, nullptr, instance_, nullptr);
     SendMessageW(tooltips_, TTM_SETMAXTIPWIDTH, 0, px(320));
     TOOLINFOW listTip{sizeof(listTip)}; listTip.hwnd = list_; listTip.uId = 1; listTip.uFlags = TTF_SUBCLASS; listTip.lpszText = LPSTR_TEXTCALLBACKW;
@@ -270,6 +288,11 @@ void App::theme() {
     if (background_) DeleteObject(background_); background_ = CreateSolidBrush(bg_);
     if (cardBrush_) DeleteObject(cardBrush_); cardBrush_ = CreateSolidBrush(card_);
     bool wasInitializing = initializing_; initializing_ = true;
+    if (qrInput_) {
+        SendMessageW(qrInput_, EM_SETBKGNDCOLOR, 0, card_);
+        CHARFORMAT2W format{}; format.cbSize = sizeof(format); format.dwMask = CFM_COLOR; format.crTextColor = ink_;
+        SendMessageW(qrInput_, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&format));
+    }
     for (const auto& control : controls_) {
         wchar_t kind[64]{}; GetClassNameW(control.window, kind, 64);
         if (wcscmp(kind, MSFTEDIT_CLASS) == 0) {
@@ -286,7 +309,7 @@ void App::fonts() {
     for (HFONT f : {font_, bold_, titleFont_, small_}) if (f) DeleteObject(f);
     auto create = [&](int height, int weight) { return CreateFontW(-px(height), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI"); };
     font_ = create(13, FW_NORMAL); bold_ = create(13, FW_SEMIBOLD); titleFont_ = create(14, FW_SEMIBOLD); small_ = create(11, FW_NORMAL);
-    for (auto w : {historyTab_, recordsTab_, settingsButton_, minimizeButton_, closeButton_, groupMore_, new_, search_, searchClear_, historyClear_, footerSave_, footerCancel_}) if (w) SendMessageW(w, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
+    for (auto w : {historyTab_, recordsTab_, qrTab_, settingsButton_, minimizeButton_, closeButton_, groupMore_, new_, search_, searchClear_, historyClear_, footerSave_, footerCancel_, qrInput_, qrRecognizeButton_, qrGenerateButton_}) if (w) SendMessageW(w, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     for (auto w : groupButtons_) if (w) SendMessageW(w, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     for (auto& c : controls_) {
         SendMessageW(c.window, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
@@ -299,8 +322,9 @@ void App::layout() {
     HDWP positions = BeginDeferWindowPos(16);
     auto move = [&](HWND child, int x, int y, int width, int height) { if (positions) positions = DeferWindowPos(positions, child, nullptr, px(x), px(y), px(std::max(1, width)), px(height), SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW); };
     move(settingsButton_, w - 132, 4, 48, 28); move(minimizeButton_, w - 80, 4, 34, 28); move(closeButton_, w - 42, 4, 34, 28);
-    move(historyTab_, 18, 43, (w - 36) / 2, 33); move(recordsTab_, 18 + (w - 36) / 2, 43, (w - 36) / 2, 33);
-    bool normal = !settingsMode_ && !groupsMode_;
+    int tabWidth = (w - 36) / 3;
+    move(historyTab_, 18, 43, tabWidth, 33); move(recordsTab_, 18 + tabWidth, 43, tabWidth, 33); move(qrTab_, 18 + tabWidth * 2, 43, w - 36 - tabWidth * 2, 33);
+    bool normal = !settingsMode_ && !groupsMode_ && tab_ != 2;
     ShowWindow(search_, normal ? SW_SHOW : SW_HIDE);
     EnableWindow(search_, !draft_ && !saving_);
     bool groupsVisible = normal && tab_ == 1 && !appendMode_;
@@ -324,12 +348,13 @@ void App::layout() {
     TOOLINFOW tip{sizeof(tip)}; tip.hwnd = list_; tip.uId = 1; GetClientRect(list_, &tip.rect);
     SendMessageW(tooltips_, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&tip));
     updateListMetrics(); positionControls(); setScroll(scroll_);
+    layoutQrControls();
     redraw();
 }
 
 void App::layoutSearch() {
     RECT rect{}; GetClientRect(window_, &rect); int width = logical(rect.right);
-    bool clear = !settingsMode_ && !groupsMode_ && !draft_ && GetWindowTextLengthW(search_) != 0;
+    bool clear = !settingsMode_ && !groupsMode_ && !draft_ && tab_ != 2 && GetWindowTextLengthW(search_) != 0;
     // 输入区始终与右边框间隔至少 12 像素，避免原生背景覆盖圆角边线。
     SetWindowPos(search_, nullptr, px(50), px(96), px(std::max(40, width - 82 - (clear ? 30 : 0))), px(19), SWP_NOZORDER | SWP_NOACTIVATE);
     SetWindowPos(searchClear_, nullptr, px(width - 52), px(91), px(28), px(28), SWP_NOZORDER | SWP_NOACTIVATE);
@@ -396,7 +421,7 @@ void App::text(HDC dc, std::wstring_view value, RECT r, HFONT font, COLORREF col
     DrawTextW(dc, value.data(), static_cast<int>(value.size()), &r, flags | DT_NOPREFIX); SelectObject(dc, old);
 }
 void App::card(HDC dc, RECT r, bool active) {
-    COLORREF selected = tab_ ? (dark_ ? RGB(44, 101, 65) : RGB(180, 220, 196)) : accent_;
+    COLORREF selected = tab_ == 1 ? (dark_ ? RGB(44, 101, 65) : RGB(180, 220, 196)) : accent_;
     HBRUSH brush = CreateSolidBrush(card_); HPEN pen = CreatePen(PS_SOLID, px(1), active ? selected : line_);
     auto oldBrush = SelectObject(dc, brush); auto oldPen = SelectObject(dc, pen);
     RoundRect(dc, r.left, r.top, r.right, r.bottom, px(10), px(10));
@@ -408,7 +433,7 @@ void App::paint(HDC dc) {
     text(dc, AppDisplayName, {px(36), px(3), r.right - px(140), px(34)}, titleFont_, ink_);
     auto border = CreateSolidBrush(line_); FrameRect(dc, &r, border); DeleteObject(border);
     int h = r.bottom; int w = r.right;
-    if (!settingsMode_ && !groupsMode_) {
+    if (!settingsMode_ && !groupsMode_ && tab_ != 2) {
         paintInput(dc, {px(20), px(87), w - px(20), px(123)}, GetFocus() == search_, IsWindowEnabled(search_));
         auto pen = CreatePen(PS_SOLID, px(1), GetFocus() == search_ ? accent_ : muted_); auto oldPen = SelectObject(dc, pen); auto oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
         Ellipse(dc, px(31), px(99), px(42), px(110)); MoveToEx(dc, px(40), px(108), nullptr); LineTo(dc, px(45), px(113));
@@ -418,7 +443,9 @@ void App::paint(HDC dc) {
         text(dc, saving_ ? L"正在保存…" : (draft_ ? (dirty_ ? L"● 未保存" : L"编辑资料") : (appendMode_ ? L"选择资料后添加字段" : L"")), {px(20), h - px(46), w - px(180), h - px(14)}, small_, muted_);
     } else {
         auto divider = CreateSolidBrush(line_); RECT line{px(20), h - px(35), w - px(20), h - px(34)}; FillRect(dc, &line, divider); DeleteObject(divider);
-        text(dc, status_.empty() ? (settings_.paused ? L"记录已暂停  ·  Esc 隐藏" : L"↑↓ 选择   Enter 操作   Esc 隐藏") : status_, {px(20), h - px(32), w - px(tab_ ? 20 : 120), h - px(4)}, small_, muted_);
+        auto hint = qrPage() ? (qrGenerateMode_ ? L"点击二维码，选择位置保存" : L"Ctrl + V 粘贴图片 · 拖入图片") : (settings_.paused ? L"记录已暂停  ·  Esc 隐藏" : L"↑↓ 选择   Enter 操作   Esc 隐藏");
+        text(dc, status_.empty() ? hint : status_, {px(20), h - px(32), w - px(qrPage() ? 118 : (tab_ ? 20 : 120)), h - px(4)}, small_, muted_);
+        if (qrPage()) text(dc, L"·", {w - px(66), h - px(31), w - px(58), h - px(5)}, small_, muted_, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 }
 
@@ -431,7 +458,9 @@ void App::paintButton(const DRAWITEMSTRUCT& draw) {
     int id = static_cast<int>(draw.CtlID);
     bool formButton = GetParent(draw.hwndItem) == list_;
     FillRect(dc, &rect, id == SearchClear || (formButton && draft_) ? cardBrush_ : background_);
-    bool activeTab = (id == HistoryTab && tab_ == 0) || (id == RecordsTab && tab_ == 1);
+    bool activeTab = (id == HistoryTab && tab_ == 0) || (id == RecordsTab && tab_ == 1) || (id == QrTab && tab_ == 2);
+    bool qrMode = id == QrRecognize || id == QrGenerate;
+    bool activeQrMode = (id == QrRecognize && !qrGenerateMode_) || (id == QrGenerate && qrGenerateMode_);
     bool activeGroup = id >= GroupFilterBase && static_cast<size_t>(id - GroupFilterBase) < visibleGroups_.size() && filters_[visibleGroups_[id - GroupFilterBase]].id == groupFilter_;
     if (id == GroupMore) activeGroup = false;
     bool primary = id == Save || activeTab;
@@ -443,7 +472,7 @@ void App::paintButton(const DRAWITEMSTRUCT& draw) {
     COLORREF fill = primary ? (hot ? RGB(6, 174, 86) : accentFill_) : (activeGroup ? accentTint_ : (hot ? (dark_ ? RGB(42, 42, 42) : RGB(239, 239, 239)) : card_));
     if (closeHot) fill = RGB(211, 53, 67);
     if (danger && hot) fill = dark_ ? RGB(70, 38, 45) : RGB(255, 237, 239);
-    if (primary || activeGroup || hot || formButton) {
+    if (!qrMode && (primary || activeGroup || hot || formButton)) {
         auto brush = CreateSolidBrush(fill); auto border = CreatePen(PS_SOLID, px(1), formButton && !primary ? line_ : fill);
         auto oldBrush = SelectObject(dc, brush); auto oldPen = SelectObject(dc, border);
         RoundRect(dc, 1, 1, width - 1, height - 1, px(8), px(8));
@@ -453,6 +482,7 @@ void App::paintButton(const DRAWITEMSTRUCT& draw) {
     if (formButton && !primary) color = ink_;
     if (danger && hot) color = dark_ ? RGB(255, 150, 160) : RGB(193, 52, 68);
     if (!enabled) color = muted_;
+    if (qrMode && enabled) color = activeQrMode || hot ? accent_ : muted_;
     if (id == Minimize || id == Close || id == SearchClear) {
         HPEN pen = CreatePen(PS_SOLID, px(1), color); auto oldPen = SelectObject(dc, pen);
         int cx = width / 2, cy = height / 2, radius = px(4);
@@ -469,9 +499,9 @@ void App::paintButton(const DRAWITEMSTRUCT& draw) {
         text(dc, L"清空历史", {px(25), 0, width - px(4), height}, small_, color);
     } else {
         RECT label = rect; InflateRect(&label, -px(5), 0);
-        text(dc, windowText(draw.hwndItem), label, activeTab ? bold_ : font_, color, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        text(dc, windowText(draw.hwndItem), label, qrMode ? small_ : (activeTab ? bold_ : font_), color, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
-    if ((draw.itemState & ODS_FOCUS) && !(draw.itemState & ODS_NOFOCUSRECT)) {
+    if (activeQrMode || ((draw.itemState & ODS_FOCUS) && !(draw.itemState & ODS_NOFOCUSRECT))) {
         RECT focus{width / 2 - px(8), height - px(3), width / 2 + px(8), height - px(2)};
         auto brush = CreateSolidBrush(color); FillRect(dc, &focus, brush); DeleteObject(brush);
     }
@@ -539,10 +569,13 @@ void App::updateListMetrics() {
     hits_.clear(); hoveredAction_ = 0; hoveredIndex_ = -1;
     for (int pass = 0; pass < 2; ++pass) {
         RECT before{}; GetClientRect(list_, &before);
-        measureFields(); rows_.clear();
-        int y = appendMode_ ? 139 : 4;
-        for (const auto& item : items_) { int height = itemHeight(item); rows_.push_back({y, height}); y += height + 9; }
-        totalHeight_ = settingsMode_ ? 725 : (groupsMode_ ? 345 : y + (more_ ? 44 : 0) + 8);
+        if (qrPage()) measureQrResults();
+        else {
+            measureFields(); rows_.clear();
+            int y = appendMode_ ? 139 : 4;
+            for (const auto& item : items_) { int height = itemHeight(item); rows_.push_back({y, height}); y += height + 9; }
+            totalHeight_ = settingsMode_ ? 725 : (groupsMode_ ? 345 : y + (more_ ? 44 : 0) + 8);
+        }
         scroll_ = std::clamp(scroll_, 0, std::max(0, totalHeight_ - viewportHeight_));
         SCROLLINFO si{sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS}; si.nMax = std::max(0, totalHeight_ - 1); si.nPage = viewportHeight_; si.nPos = scroll_; SetScrollInfo(list_, SB_VERT, &si, TRUE);
         RECT after{}; GetClientRect(list_, &after);
@@ -554,7 +587,9 @@ void App::updateListMetrics() {
 // 列表只绘制可视卡片；完整字段仅在展开一条资料时取出。
 void App::paintList(HDC dc) {
     RECT client{}; GetClientRect(list_, &client); FillRect(dc, &client, background_);
-    hits_.clear(); rows_.clear();
+    hits_.clear();
+    if (qrPage()) { paintQrResults(dc); return; }
+    rows_.clear();
     if (settingsMode_ || groupsMode_) { paintForm(dc); return; }
     int w = logical(client.right), y = appendMode_ ? 139 : 4;
     if (appendMode_) text(dc, L"添加历史为字段 · 选择目标资料", {px(20), px(2 - scroll_), px(w - 20), px(30 - scroll_)}, bold_, ink_);
@@ -663,6 +698,7 @@ LRESULT App::listMessage(UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSELEAVE: hoveredAction_ = 0; hoveredIndex_ = -1; InvalidateRect(list_, nullptr, FALSE); return 0;
     case WM_LBUTTONDOWN: {
+        if (qrPage()) { SetFocus(list_); return 0; }
         suppressRecordClick_ = false;
         if (tab_ == 1 && ready_ && !loading_ && !saving_ && !draft_ && !appendMode_ && !settingsMode_ && !groupsMode_) {
             POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -684,8 +720,11 @@ LRESULT App::listMessage(UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CAPTURECHANGED: if (recordDrag_.pressed && reinterpret_cast<HWND>(lp) != list_) finishRecordDrag(false); return 0;
     case WM_CANCELMODE: finishRecordDrag(false); return 0;
-    case WM_SETCURSOR: if (recordDrag_.active) { SetCursor(LoadCursorW(nullptr, recordDrag_.anchor ? IDC_SIZEALL : IDC_NO)); return TRUE; } break;
-    case WM_CONTEXTMENU: { POINT screen{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, p = screen; if (screen.x == -1) { p = {px(40), px(30)}; screen = p; ClientToScreen(list_, &screen); } else ScreenToClient(list_, &p); for (size_t i = 0; i < rows_.size(); ++i) if (logical(p.y) + scroll_ >= rows_[i].first && logical(p.y) + scroll_ < rows_[i].first + rows_[i].second) { menu(static_cast<int>(i), screen); return 0; } if (selected_ < static_cast<int>(items_.size())) menu(selected_, screen); return 0; }
+    case WM_SETCURSOR:
+        if (recordDrag_.active) { SetCursor(LoadCursorW(nullptr, recordDrag_.anchor ? IDC_SIZEALL : IDC_NO)); return TRUE; }
+        if (qrPage() && (hoveredAction_ == CopyQrValue || hoveredAction_ == CopyQrId || hoveredAction_ == SaveQrImage)) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
+        break;
+    case WM_CONTEXTMENU: { if (qrPage()) return 0; POINT screen{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, p = screen; if (screen.x == -1) { p = {px(40), px(30)}; screen = p; ClientToScreen(list_, &screen); } else ScreenToClient(list_, &p); for (size_t i = 0; i < rows_.size(); ++i) if (logical(p.y) + scroll_ >= rows_[i].first && logical(p.y) + scroll_ < rows_[i].first + rows_[i].second) { menu(static_cast<int>(i), screen); return 0; } if (selected_ < static_cast<int>(items_.size())) menu(selected_, screen); return 0; }
     case WM_COMMAND: case WM_NOTIFY: case WM_DRAWITEM: case WM_MEASUREITEM: return message(msg, wp, lp);
     case WM_CTLCOLOREDIT: case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLORLISTBOX: return message(msg, wp, lp);
     }
@@ -744,7 +783,7 @@ HWND App::control(const wchar_t* kind, const std::wstring& value, DWORD style, i
 }
 
 void App::refresh(bool append, bool keepExpanded) {
-    if (!ready_ || (loading_ && append) || draft_) return;
+    if (!ready_ || tab_ == 2 || (loading_ && append) || draft_) return;
     if (!append) finishRecordDrag(false);
     if (!append) { ++revision_; loading_ = false; if (!keepExpanded) collapse(); selected_ = 0; fieldSelected_ = -1; setScroll(0); }
     const int revision = revision_, tab = tab_, offset = append ? static_cast<int>(items_.size()) : 0;
@@ -892,7 +931,8 @@ void App::switchTab(int tab) {
     if (tab == tab_ && !settingsMode_ && !groupsMode_) return;
     if (!leave()) return;
     tab_ = tab; initializing_ = true; SetWindowTextW(search_, L""); initializing_ = false;
-    layout(); refresh(); SetFocus(search_);
+    scroll_ = 0; status_.clear(); qrDragging_ = false;
+    layout(); refresh(); SetFocus(qrFocus());
 }
 void App::show(bool reset) {
     silentLaunch_ = false;
@@ -905,7 +945,7 @@ void App::show(bool reset) {
         RECT r{}; GetWindowRect(window_, &r); int w = r.right - r.left, h = r.bottom - r.top;
         SetWindowPos(window_, HWND_TOP, info.rcWork.left + (info.rcWork.right - info.rcWork.left - w) / 2, info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - h) / 2, 0, 0, SWP_NOSIZE);
     }
-    ShowWindow(window_, SW_SHOWNORMAL); SetForegroundWindow(window_); SetFocus(search_);
+    ShowWindow(window_, SW_SHOWNORMAL); SetForegroundWindow(window_); SetFocus(qrFocus());
 }
 bool App::hide() {
     if (!leave()) return false;
@@ -937,6 +977,7 @@ void App::navigate(int delta) {
     InvalidateRect(list_, nullptr, TRUE);
 }
 void App::action(int kind, int index) {
+    if (qrPage()) { if (kind == CopyQrValue || kind == CopyQrId) copyQrResult(index, kind == CopyQrId); else if (kind == SaveQrImage) saveQrImage(); return; }
     if (saving_) return;
     if (kind == LoadMore) { refresh(true, true); return; }
     if (kind == Open) { if (tab_) openRecord(index); else activate(index); return; }
@@ -1039,7 +1080,7 @@ void App::cancelDraft() {
     destroyControls(); draft_.reset(); dirty_ = false; EnableWindow(list_, TRUE);
     if (wasNew) collapse();
     if (settingsMode_ || groupsMode_ || appendMode_) { settingsMode_ = groupsMode_ = appendMode_ = false; wipe(appendValue_); collapse(); }
-    layout(); refresh(false, !wasNew); SetFocus(search_);
+    layout(); refresh(false, !wasNew); SetFocus(qrFocus());
 }
 
 void App::settingsPanel() {
@@ -1323,7 +1364,9 @@ bool App::key(MSG& msg) {
     if (msg.wParam == VK_APPS || (msg.wParam == VK_F10 && GetKeyState(VK_SHIFT) < 0)) {
         if (std::find(groupButtons_.begin(), groupButtons_.end(), msg.hwnd) != groupButtons_.end()) { RECT rect{}; GetWindowRect(msg.hwnd, &rect); groupMenu({rect.left, rect.bottom}); return true; }
     }
-    if (ctrl && (msg.wParam == VK_RIGHT || msg.wParam == VK_LEFT)) { switchTab(msg.wParam == VK_RIGHT ? 1 : 0); return true; }
+    if (ctrl && msg.hwnd != qrInput_ && (msg.wParam == VK_RIGHT || msg.wParam == VK_LEFT)) { switchTab((tab_ + (msg.wParam == VK_RIGHT ? 1 : 2)) % 3); return true; }
+    if (qrRecognitionPage() && ctrl && msg.wParam == 'V') { if (!(msg.lParam & (1LL << 30))) pasteQrImage(); return true; }
+    if (qrPage() && msg.hwnd == qrInput_ && ctrl && msg.wParam == 'A') { SendMessageW(qrInput_, EM_SETSEL, 0, -1); return true; }
     if (msg.wParam == VK_ESCAPE) {
         if (draft_ || settingsMode_ || groupsMode_ || appendMode_) cancelDraft();
         else if (expanded_.id) { collapse(); layout(); SetFocus(search_); }
@@ -1331,6 +1374,7 @@ bool App::key(MSG& msg) {
         return true;
     }
     if (ctrl && msg.wParam == 'S') { if (draft_) saveDraft(); else if (settingsMode_) saveSettings(); return true; }
+    if (qrPage()) return false;
     bool root = msg.hwnd == search_ || msg.hwnd == list_ || msg.hwnd == historyTab_ || msg.hwnd == recordsTab_;
     if (!root || draft_ || settingsMode_ || groupsMode_) return false;
     if (msg.wParam == VK_DOWN || msg.wParam == VK_UP) { navigate(msg.wParam == VK_DOWN ? 1 : -1); return true; }
@@ -1358,6 +1402,9 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
                 if (it->action == Edit) tooltipText_ = L"编辑这条资料";
                 if (it->action == Reveal) tooltipText_ = L"显示或隐藏敏感字段";
                 if (it->action == FullText) tooltipText_ = L"原地展开或收起全文";
+                if (qrPage() && it->action == CopyQrValue) tooltipText_ = L"点击复制原始值";
+                if (qrPage() && it->action == CopyQrId) tooltipText_ = L"点击复制 ID";
+                if (qrPage() && it->action == SaveQrImage) tooltipText_ = L"点击选择位置，保存为 PNG 图片";
                 if (it->action == Open && tab_ == 1 && !draft_ && !appendMode_) tooltipText_ = L"点击展开资料，长按标题拖拽排序";
                 break;
             }
@@ -1390,7 +1437,7 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETTINGCHANGE: theme(); return 0;
     case WM_LBUTTONDOWN: {
         RECT client{}; GetClientRect(window_, &client); RECT search{px(20), px(87), client.right - px(20), px(123)};
-        if (!settingsMode_ && !groupsMode_ && IsWindowEnabled(search_) && PtInRect(&search, {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)})) { SetFocus(search_); return 0; }
+        if (!settingsMode_ && !groupsMode_ && tab_ != 2 && IsWindowEnabled(search_) && PtInRect(&search, {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)})) { SetFocus(search_); return 0; }
         break;
     }
     case WM_CLOSE: hide(); return 0;
@@ -1399,7 +1446,8 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE) finishRecordDrag(false);
         // 键盘切换和正常失焦保持可见；只有显式开启的窗外点击才隐藏。
-        if (LOWORD(wp) == WA_INACTIVE && settings_.hideOutside && !inMenu_ && !saving_ && IsWindowVisible(window_) && ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000)) {
+        // 二维码页保持可见，便于切到文件管理器选择并拖入图片。
+        if (LOWORD(wp) == WA_INACTIVE && settings_.hideOutside && !qrPage() && !inMenu_ && !saving_ && IsWindowVisible(window_) && ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON)) & 0x8000)) {
             auto next = reinterpret_cast<HWND>(lp);
             if (!next || (GetAncestor(next, GA_ROOTOWNER) != window_ && !IsChild(window_, next))) hide();
         }
@@ -1407,6 +1455,7 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_HOTKEY: if (hotkeyRegistered_ && wp == static_cast<WPARAM>(hotkeyId_)) show(); return 0;
     case WM_CLIPBOARDUPDATE: captureRetries_ = 0; pendingSequence_ = GetClipboardSequenceNumber(); capture(); return 0;
     case WM_TIMER:
+        if (wp == QrGenerateTimer) generateQrPreview();
         if (wp == RecordPressTimer) startRecordDrag();
         if (wp == RecordDragTimer) recordDragTick();
         if (wp == SearchTimer) { KillTimer(window_, SearchTimer); refresh(); }
@@ -1428,6 +1477,7 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND: {
         int id = LOWORD(wp), notification = HIWORD(wp);
         if (initializing_) return 0;
+        if (id == QrInput && notification == EN_CHANGE) { qrInputChanged(); return 0; }
         if (notification == CBN_DROPDOWN) guardComboWheel(reinterpret_cast<HWND>(lp), list_);
         if (id == Search && notification == EN_CHANGE) {
             if (draft_) { if (!leave()) return 0; layout(); }
@@ -1435,6 +1485,8 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (id == HistoryTab) switchTab(0);
         else if (id == RecordsTab) switchTab(1);
+        else if (id == QrTab) switchTab(2);
+        else if (id == QrRecognize || id == QrGenerate) switchQrMode(id == QrGenerate);
         else if (id == Minimize || id == Close) hide();
         else if (id >= GroupFilterBase && static_cast<size_t>(id - GroupFilterBase) < visibleGroups_.size() && GetParent(reinterpret_cast<HWND>(lp)) == window_) selectGroup(filters_[visibleGroups_[id - GroupFilterBase]].id);
         else if (id == GroupMore) groupMenu();
@@ -1501,6 +1553,7 @@ LRESULT App::message(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_QUERYENDSESSION: return TRUE;
     case WM_ENDSESSION: if (wp) DestroyWindow(window_); return 0;
     case WM_DESTROY: {
+        stopQr();
         finishRecordDrag(false);
         if (recordGhost_) { DestroyWindow(recordGhost_); recordGhost_ = nullptr; }
         winVHotkey_.stop();
